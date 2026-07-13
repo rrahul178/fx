@@ -87,7 +87,7 @@
     <div class="nav-item" onclick="showSection('pairs', this)">⚙️ Pairs (Max 8)</div>
     <div class="nav-item" onclick="showSection('telegram', this)">🔔 Telegram</div>
     <div class="nav-item" onclick="showSection('history', this)">📈 History / Win Rate</div>
-    <div class="sidebar-footer">ICT + Patterns + UT Bot + HTF<br>Max Confluence System</div>
+    <div class="sidebar-footer">ICT · Trend Pullback · Breakout · Swing<br>4 Strategy Engines</div>
   </div>
 
   <div class="main">
@@ -99,6 +99,12 @@
         <select id="statusFilter" onchange="renderCards()">
           <option value="ALL">All</option>
           <option value="VALID">A+ Setups Only</option>
+        </select>
+        <select id="strategySelect" onchange="reAnalyzeCached()">
+          <option value="ict">🧠 ICT / Smart Money</option>
+          <option value="trend">📈 Trend Pullback (EMA)</option>
+          <option value="breakout">💥 Breakout</option>
+          <option value="swing">🐢 Swing (4H)</option>
         </select>
         <button class="btn" id="scanBtn" onclick="runSmartScan()">⟳ Smart Scan</button>
         <button class="btn ghost" id="autoBtn" onclick="toggleLive()">Live: OFF</button>
@@ -143,7 +149,7 @@ let apiKey = localStorage.getItem('rd_apikey') || "";
 const BASE_URL = `https://api.twelvedata.com/time_series?interval=1h&outputsize=100&symbol=`;
 const ALL_PAIRS = ["EUR/USD","GBP/USD","USD/JPY","USD/CHF","AUD/USD","USD/CAD","NZD/USD","EUR/JPY","EUR/GBP","GBP/JPY","AUD/JPY","EUR/AUD","GBP/AUD","EUR/CHF","USD/TRY","USD/ZAR","USD/MXN","USD/SGD"];
 let selectedPairs = JSON.parse(localStorage.getItem('rd_pairs')) || ALL_PAIRS.slice(0, 8);
-let rawSignals = [], liveInterval = null;
+let rawSignals = [], liveInterval = null, rawApiData = {};
 let tgConfig = JSON.parse(localStorage.getItem('rd_tg')) || { token: "", chatId: "" };
 let historyLog = JSON.parse(localStorage.getItem('rd_history')) || [];
 
@@ -324,6 +330,144 @@ function analyzeICT(symbol, data) {
   return { symbol, price: last.c, change1h, volRatio, direction: status === "VALID" ? dir : "WAIT", confidence, status, isICT: status === "VALID", ictReason: reasons.join(" + "), utBotSL: utBot.trailingStop, htfTrend, score, reasons };
 }
 
+/* ================= SHARED HELPERS ================= */
+function computeATR(candles, period = 14) {
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], p = candles[i - 1];
+    trs.push(Math.max(c.h - c.l, Math.abs(c.h - p.c), Math.abs(c.l - p.c)));
+  }
+  const recent = trs.slice(-period);
+  return recent.reduce((a, b) => a + b, 0) / recent.length;
+}
+function emaSeries(values, period) {
+  const k = 2 / (period + 1); const arr = [values[0]];
+  for (let i = 1; i < values.length; i++) arr.push(values[i] * k + arr[i - 1] * (1 - k));
+  return arr;
+}
+function toCandles(data) { return data.values.slice().reverse().map(v => ({ t: v.datetime, o: +v.open, h: +v.high, l: +v.low, c: +v.close })); }
+function waitResult(symbol, price, change1h, reason) { return { symbol, price, change1h, volRatio: 1, direction: "WAIT", confidence: 0, status: "OBSERVE", isICT: false, ictReason: reason, utBotSL: null, reasons: [] }; }
+
+/* ================= STRATEGY: TREND PULLBACK (EMA 20/50) ================= */
+function analyzeTrendPullback(symbol, data) {
+  const candles = toCandles(data);
+  if (candles.length < 55) return waitResult(symbol, candles[candles.length - 1].c, 0, "Not enough data");
+  const last = candles[candles.length - 1], prevClose = candles[candles.length - 2].c;
+  const change1h = ((last.c - prevClose) / prevClose) * 100;
+  const closes = candles.map(c => c.c);
+  const ema20 = emaSeries(closes, 20), ema50 = emaSeries(closes, 50);
+  const e20 = ema20[ema20.length - 1], e50 = ema50[ema50.length - 1], prevE20 = ema20[ema20.length - 2];
+
+  let dir = null, reasons = [], score = 0;
+  if (e20 > e50) { dir = "LONG"; score++; reasons.push("EMA20>EMA50 Uptrend"); }
+  else if (e20 < e50) { dir = "SHORT"; score++; reasons.push("EMA20<EMA50 Downtrend"); }
+  if (!dir) return waitResult(symbol, last.c, change1h, "No Trend");
+
+  if ((dir === "LONG" && e20 > prevE20) || (dir === "SHORT" && e20 < prevE20)) { score++; reasons.push("EMA Slope Confirmed"); }
+
+  const atr = computeATR(candles, 14);
+  const distToEma = Math.abs(last.c - e20);
+  const touchedRecently = candles.slice(-5).some(c => Math.abs(c.l - e20) <= atr * 0.6 || Math.abs(c.h - e20) <= atr * 0.6);
+  if (touchedRecently && distToEma <= atr * 1.2) { score++; reasons.push("Pullback to EMA20"); }
+
+  const patterns = detectPatterns(candles);
+  const validPat = patterns.find(p => p.bull === (dir === "LONG") && p.confidence >= 0.6);
+  if (validPat) { score++; reasons.push(validPat.name); }
+  else if ((dir === "LONG" && last.c > last.o) || (dir === "SHORT" && last.c < last.o)) { score++; reasons.push("Momentum Candle"); }
+
+  const status = score >= 3 ? "VALID" : "OBSERVE";
+  const confidence = Math.min(95, Math.round(40 + score * 13));
+  const sl = dir === "LONG" ? last.c - atr * 1.5 : last.c + atr * 1.5;
+
+  return { symbol, price: last.c, change1h, volRatio: 1, direction: status === "VALID" ? dir : "WAIT", confidence, status, isICT: status === "VALID", ictReason: reasons.join(" + "), utBotSL: sl, reasons };
+}
+
+/* ================= STRATEGY: BREAKOUT ================= */
+function analyzeBreakout(symbol, data) {
+  const candles = toCandles(data);
+  if (candles.length < 25) return waitResult(symbol, candles[candles.length - 1].c, 0, "Not enough data");
+  const last = candles[candles.length - 1], prevClose = candles[candles.length - 2].c;
+  const change1h = ((last.c - prevClose) / prevClose) * 100;
+
+  const rangeWindow = candles.slice(-21, -1);
+  const rHigh = Math.max(...rangeWindow.map(c => c.h)), rLow = Math.min(...rangeWindow.map(c => c.l));
+  const avgRange = rangeWindow.reduce((a, c) => a + (c.h - c.l), 0) / rangeWindow.length;
+  const rangeSize = rHigh - rLow;
+
+  let dir = null, reasons = [], score = 0;
+  if (rangeSize <= avgRange * 6) { score++; reasons.push("Consolidation Range"); }
+
+  if (last.c > rHigh) { dir = "LONG"; score++; reasons.push("Bull Breakout"); }
+  else if (last.c < rLow) { dir = "SHORT"; score++; reasons.push("Bear Breakout"); }
+  if (!dir) return waitResult(symbol, last.c, change1h, "No Breakout");
+
+  const bodySize = Math.abs(last.c - last.o);
+  if (bodySize >= avgRange * 1.3) { score++; reasons.push("Momentum Candle"); }
+
+  const closeMargin = dir === "LONG" ? last.c - rHigh : rLow - last.c;
+  if (closeMargin >= avgRange * 0.15) { score++; reasons.push("Clean Break"); }
+
+  const status = score >= 3 ? "VALID" : "OBSERVE";
+  const confidence = Math.min(95, Math.round(40 + score * 14));
+  const sl = dir === "LONG" ? rLow : rHigh;
+
+  return { symbol, price: last.c, change1h, volRatio: (last.h - last.l) / avgRange, direction: status === "VALID" ? dir : "WAIT", confidence, status, isICT: status === "VALID", ictReason: reasons.join(" + "), utBotSL: sl, reasons };
+}
+
+/* ================= STRATEGY: SWING (4H structure, built locally from 1H candles) ================= */
+function analyzeSwing(symbol, data) {
+  const candles1h = toCandles(data);
+  const candles = aggregateToHTF(candles1h, 4);
+  if (candles.length < 20) return waitResult(symbol, candles1h[candles1h.length - 1].c, 0, "Not enough 4H history");
+  const last = candles[candles.length - 1], prevClose = candles[candles.length - 2].c;
+  const change1h = ((last.c - prevClose) / prevClose) * 100;
+
+  const eq = getEquilibrium(candles);
+  const { highs, lows } = findSwings(candles, 2);
+  let dir = null, reasons = [], score = 0;
+
+  if (highs.length >= 2 && lows.length >= 2) {
+    const lH = highs[highs.length - 1], pL = lows[lows.length - 2], lL = lows[lows.length - 1];
+    if (last.c > lH.price && lH.price > highs[highs.length - 2].price && lL.price > pL.price) { dir = "LONG"; score++; reasons.push("4H Bullish BOS"); }
+    else if (last.c < lL.price && lL.price < lows[lows.length - 2].price && lH.price < highs[highs.length - 2].price) { dir = "SHORT"; score++; reasons.push("4H Bearish BOS"); }
+  }
+  if (!dir) return waitResult(symbol, last.c, change1h, "No 4H Structure");
+
+  if ((dir === "LONG" && last.c < eq.eq) || (dir === "SHORT" && last.c > eq.eq)) { score++; reasons.push(dir === "LONG" ? "4H Discount" : "4H Premium"); }
+
+  let hasPOI = false;
+  for (let i = candles.length - 2; i >= Math.max(1, candles.length - 15); i--) {
+    const a = candles[i - 1], c = candles[i + 1], b = candles[i];
+    if (!a || !c) continue;
+    if (dir === "LONG" && c.l > a.h) { hasPOI = true; reasons.push("4H Bull FVG"); break; }
+    if (dir === "SHORT" && c.h < a.l) { hasPOI = true; reasons.push("4H Bear FVG"); break; }
+  }
+  if (hasPOI) score++;
+
+  const atr4h = computeATR(candles, 10);
+  const status = score >= 2 ? "VALID" : "OBSERVE"; // fewer 4H swings occur, so threshold is intentionally lower on a 3-pt max
+  const confidence = Math.min(95, Math.round(45 + score * 15));
+  const sl = dir === "LONG" ? last.c - atr4h * 2 : last.c + atr4h * 2;
+
+  return { symbol, price: last.c, change1h, volRatio: 1, direction: status === "VALID" ? dir : "WAIT", confidence, status, isICT: status === "VALID", ictReason: reasons.join(" + ") + " (Swing)", utBotSL: sl, reasons };
+}
+
+/* ================= STRATEGY DISPATCHER ================= */
+function analyzeSignal(symbol, data) {
+  const strat = document.getElementById('strategySelect').value;
+  if (strat === 'trend') return analyzeTrendPullback(symbol, data);
+  if (strat === 'breakout') return analyzeBreakout(symbol, data);
+  if (strat === 'swing') return analyzeSwing(symbol, data);
+  return analyzeICT(symbol, data);
+}
+function reAnalyzeCached() {
+  const cachedPairs = selectedPairs.filter(p => rawApiData[p]);
+  if (!cachedPairs.length) return;
+  const results = cachedPairs.map(p => analyzeSignal(p, rawApiData[p]));
+  results.forEach(r => updateHistory(r));
+  rawSignals = results; renderCards(); renderHistory();
+}
+
 /* ================= SCANNER UI ================= */
 async function runSmartScan() {
   hideError();
@@ -337,13 +481,13 @@ async function runSmartScan() {
       const res = await fetch(`${BASE_URL}${encodeURIComponent(selectedPairs[i])}&apikey=${encodeURIComponent(apiKey)}`);
       const data = await res.json();
       if(data.status === "error") throw new Error(data.message);
-      if (data.values) { const r = analyzeICT(selectedPairs[i], data); results.push(r); updateHistory(r); }
+      if (data.values) { rawApiData[selectedPairs[i]] = data; const r = analyzeSignal(selectedPairs[i], data); results.push(r); updateHistory(r); }
     } catch (e) { showError(e.message); btn.disabled = false; status.textContent = "Failed"; document.getElementById('grid').innerHTML = ''; return; }
     if (i < selectedPairs.length - 1) await new Promise(r => setTimeout(r, 7500));
   }
   rawSignals = results; renderCards(); renderHistory();
   const valids = rawSignals.filter(s => s.status === "VALID");
-  valids.forEach(v => sendTgAlert(`🧠 <b>Rahul Dada Ultimate FX</b>\n${v.symbol} | ${v.direction}\n${v.confidence}%\n${v.ictReason}\nUT Bot SL: ${v.utBotSL.toFixed(5)}`));
+  valids.forEach(v => sendTgAlert(`🧠 <b>Rahul Dada Ultimate FX</b>\n${v.symbol} | ${v.direction}\n${v.confidence}%\n${v.ictReason}\nStop Loss: ${v.utBotSL.toFixed(5)}`));
   status.textContent = `Done. ${valids.length} Ultimate setups found.`; btn.disabled = false;
 }
 
@@ -383,7 +527,7 @@ function renderCards() {
       </div>
       <div class="stats-row" style="border:none;padding-top:4px;">
         <span>Vol: <b>${s.volRatio.toFixed(2)}x</b></span>
-        <span>UT Bot SL: <b style="color:var(--gold)">${s.utBotSL ? s.utBotSL.toFixed(5) : 'N/A'}</b></span>
+        <span>Stop Loss: <b style="color:var(--gold)">${s.utBotSL ? s.utBotSL.toFixed(5) : 'N/A'}</b></span>
       </div>
     </div>`;
   }).join('');
